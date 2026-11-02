@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="tr" class="dark">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>.NET 10 Pomodoro</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+
+<body class="bg-slate-950 text-slate-100 min-h-screen flex items-center justify-center p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 sm:p-8 w-full max-w-md shadow-2xl space-y-6">
+
+        <!-- Üst Bilgi -->
+        <div class="flex items-center justify-between">
+            <span class="text-xs uppercase tracking-widest text-slate-400 font-semibold"
+                id="sessionLabel">Çalışma</span>
+            <span class="text-xs bg-slate-800 px-3 py-1 rounded-full text-emerald-400 font-mono" id="cycleBadge">Döngü:
+                1</span>
+        </div>
+
+        <!-- Mod Seçimi (Presets) -->
+        <div class="grid grid-cols-3 gap-2">
+            <button onclick="setPreset(25, 5, 15, this)"
+                class="preset-btn bg-slate-800 hover:bg-slate-700 text-xs py-2 px-3 rounded-lg border border-slate-700 transition">25/5
+                Klasik</button>
+            <button onclick="setPreset(50, 10, 20, this)"
+                class="preset-btn bg-slate-800 hover:bg-slate-700 text-xs py-2 px-3 rounded-lg border border-slate-700 transition">50/10
+                Derin</button>
+            <button onclick="setPreset(40, 20, 30, this)"
+                class="preset-btn bg-slate-800 hover:bg-slate-700 text-xs py-2 px-3 rounded-lg border border-slate-700 transition">40/20
+                Anime</button>
+        </div>
+
+        <!-- Sayaç Ekranı -->
+        <div class="text-center py-4">
+            <div id="timerDisplay" class="text-6xl sm:text-7xl font-mono font-bold tracking-tighter text-white">25:00
+            </div>
+
+            <!-- Progress Bar -->
+            <div class="w-full bg-slate-800 h-2 rounded-full mt-6 overflow-hidden">
+                <div id="progressBar" class="bg-emerald-500 h-full transition-all duration-300" style="width: 100%;">
+                </div>
+            </div>
+        </div>
+
+        <!-- Kontroller -->
+        <div class="flex items-center justify-center gap-3">
+            <button id="toggleBtn" onclick="toggleTimer()"
+                class="flex-1 bg-emerald-600 hover:bg-emerald-500 font-medium py-3 rounded-xl transition shadow-lg shadow-emerald-900/20">
+                Başlat
+            </button>
+            <button onclick="skipTimer()"
+                class="bg-slate-800 hover:bg-slate-700 border border-slate-700 px-4 py-3 rounded-xl transition"
+                title="Adımı Atla">
+                ⏭
+            </button>
+            <button onclick="resetTimer()"
+                class="bg-slate-800 hover:bg-slate-700 border border-slate-700 px-4 py-3 rounded-xl transition"
+                title="Sıfırla">
+                ↺
+            </button>
+        </div>
+    </div>
+
+    <script>
+        let currentConfig = {work: 25, break: 5, longBreak: 15};
+        let previousSession = null;
+
+        function playBeep() {
+            try {
+                const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+                osc.type = "sine";
+                osc.frequency.setValueAtTime(880, ctx.currentTime);
+                gain.gain.setValueAtTime(0.1, ctx.currentTime);
+                osc.start();
+                osc.stop(ctx.currentTime + 0.4);
+            } catch (e) { }
+        }
+
+        async function setPreset(w, b, lb, btn) {
+            currentConfig = {work: w, break: b, longBreak: lb};
+
+            // Buton stillerini güncelle
+            document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('border-emerald-500', 'text-emerald-400'));
+            btn.classList.add('border-emerald-500', 'text-emerald-400');
+
+            // Backend'e yeni süreyi bildir ve anında ekranı güncelle
+            await fetch('/api/configure', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({workMinutes: w, breakMinutes: b, longBreakMinutes: lb})
+            });
+
+            // Ekrandaki sayacı ve barı hemen yenile
+            syncState();
+        }
+
+        async function syncState() {
+            const res = await fetch('/api/state');
+            const data = await res.json();
+
+            const min = Math.floor(data.remainingSeconds / 60).toString().padStart(2, '0');
+            const sec = (data.remainingSeconds % 60).toString().padStart(2, '0');
+            document.getElementById('timerDisplay').innerText = `${min}:${sec}`;
+            document.title = `${min}:${sec} - Pomodoro`;
+
+            const progress = (data.remainingSeconds / (data.totalSeconds || 1)) * 100;
+            document.getElementById('progressBar').style.width = `${progress}%`;
+
+            const sessionNames = {Work: 'Çalışma Zamanı', ShortBreak: 'Kısa Mola', LongBreak: 'Uzun Mola'};
+            document.getElementById('sessionLabel').innerText = sessionNames[data.session] || data.session;
+            document.getElementById('cycleBadge').innerText = `Döngü: ${data.currentCycle}`;
+
+            const toggleBtn = document.getElementById('toggleBtn');
+            if (data.status === 'Running') {
+                toggleBtn.innerText = 'Duraklat';
+                toggleBtn.className = 'flex-1 bg-amber-600 hover:bg-amber-500 font-medium py-3 rounded-xl transition shadow-lg shadow-amber-900/20';
+            } else {
+                toggleBtn.innerText = data.status === 'Paused' ? 'Devam Et' : 'Başlat';
+                toggleBtn.className = 'flex-1 bg-emerald-600 hover:bg-emerald-500 font-medium py-3 rounded-xl transition shadow-lg shadow-emerald-900/20';
+            }
+
+            if (previousSession && previousSession !== data.session) {
+                playBeep();
+            }
+            previousSession = data.session;
+        }
+
+        async function toggleTimer() {
+            const state = await (await fetch('/api/state')).json();
+            if (state.status === 'Idle') {
+                await fetch('/api/start', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({workMinutes: currentConfig.work, breakMinutes: currentConfig.break, longBreakMinutes: currentConfig.longBreak})
+                });
+            } else {
+                await fetch('/api/pause', {method: 'POST'});
+            }
+            syncState();
+        }
+
+        async function skipTimer() {
+            await fetch('/api/skip', {method: 'POST'});
+            syncState();
+        }
+
+        async function resetTimer() {
+            await fetch('/api/reset', {method: 'POST'});
+            syncState();
+        }
+
+        setInterval(syncState, 1000);
+        syncState();
+    </script>
+</body>
+
+</html>
