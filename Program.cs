@@ -1,4 +1,4 @@
-using System.Text.Json.Serialization;
+using System.Diagnostics;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -7,11 +7,34 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<PomodoroEngine>())
 
 var app = builder.Build();
 
+app.Urls.Add("http://localhost:5000");
+
 app.UseDefaultFiles();
 app.UseStaticFiles();
 
+// Tarayıcı açıldığında otomatik başlatma
+var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
+lifetime.ApplicationStarted.Register(() =>
+{
+    try
+    {
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = "http://localhost:5000",
+            UseShellExecute = true
+        });
+    }
+    catch { }
+});
+
 // Endpoints
 app.MapGet("/api/state", (PomodoroEngine engine) => Results.Ok(engine.GetState()));
+
+app.MapPost("/api/configure", (PomodoroEngine engine, StartRequest req) =>
+{
+    engine.Configure(req.WorkMinutes, req.BreakMinutes, req.LongBreakMinutes);
+    return Results.Ok(engine.GetState());
+});
 
 app.MapPost("/api/start", (PomodoroEngine engine, StartRequest? req) =>
 {
@@ -37,32 +60,32 @@ app.MapPost("/api/reset", (PomodoroEngine engine) =>
     return Results.Ok(engine.GetState());
 });
 
-app.MapPost("/api/configure", (PomodoroEngine engine, StartRequest req) =>
+// Tarayıcı sekmesi kapanınca çalışan endpoint'ler
+app.MapPost("/api/heartbeat", (PomodoroEngine engine) =>
 {
-    engine.Configure(req.WorkMinutes, req.BreakMinutes, req.LongBreakMinutes);
-    return Results.Ok(engine.GetState());
+    engine.RegisterHeartbeat();
+    return Results.Ok();
+});
+
+app.MapPost("/api/shutdown", (IHostApplicationLifetime appLifetime) =>
+{
+    appLifetime.StopApplication();
+    return Results.Ok();
 });
 
 app.Run();
 
-// Models & Engine
+// Modeller ve Motor
 public record StartRequest(int WorkMinutes, int BreakMinutes, int LongBreakMinutes);
-
 public enum SessionType { Work, ShortBreak, LongBreak }
 public enum TimerStatus { Idle, Running, Paused }
 
-public record PomodoroDto(
-    string Status,
-    string Session,
-    int RemainingSeconds,
-    int TotalSeconds,
-    int CompletedCycles,
-    int CurrentCycle
-);
+public record PomodoroDto(string Status, string Session, int RemainingSeconds, int TotalSeconds, int CompletedCycles, int CurrentCycle);
 
 public class PomodoroEngine : BackgroundService
 {
     private readonly object _lock = new();
+    private readonly IHostApplicationLifetime _lifetime;
     private TimerStatus _status = TimerStatus.Idle;
     private SessionType _session = SessionType.Work;
 
@@ -75,18 +98,47 @@ public class PomodoroEngine : BackgroundService
     private int _completedCycles = 0;
     private int _currentCycle = 1;
 
+    // Heartbeat Takibi
+    private DateTime _lastHeartbeat = DateTime.UtcNow;
+    private bool _hasReceivedFirstHeartbeat = false;
+    private readonly DateTime _startedAt = DateTime.UtcNow;
+
+    public PomodoroEngine(IHostApplicationLifetime lifetime)
+    {
+        _lifetime = lifetime;
+    }
+
+    public void RegisterHeartbeat()
+    {
+        lock (_lock)
+        {
+            _hasReceivedFirstHeartbeat = true;
+            _lastHeartbeat = DateTime.UtcNow;
+        }
+    }
+
     public PomodoroDto GetState()
     {
         lock (_lock)
         {
-            return new PomodoroDto(
-                _status.ToString(),
-                _session.ToString(),
-                _remainingSec,
-                _totalSec,
-                _completedCycles,
-                _currentCycle
-            );
+            return new PomodoroDto(_status.ToString(), _session.ToString(), _remainingSec, _totalSec, _completedCycles, _currentCycle);
+        }
+    }
+
+    public void Configure(int workMin, int breakMin, int longBreakMin)
+    {
+        lock (_lock)
+        {
+            _workSec = workMin * 60;
+            _shortBreakSec = breakMin * 60;
+            _longBreakSec = longBreakMin * 60;
+
+            if (_status == TimerStatus.Idle)
+            {
+                _session = SessionType.Work;
+                _totalSec = _workSec;
+                _remainingSec = _workSec;
+            }
         }
     }
 
@@ -138,23 +190,6 @@ public class PomodoroEngine : BackgroundService
         }
     }
 
-    public void Configure(int workMin, int breakMin, int longBreakMin)
-    {
-        lock (_lock)
-        {
-            _workSec = workMin * 60;
-            _shortBreakSec = breakMin * 60;
-            _longBreakSec = longBreakMin * 60;
-
-            if (_status == TimerStatus.Idle)
-            {
-                _session = SessionType.Work;
-                _totalSec = _workSec;
-                _remainingSec = _workSec;
-            }
-        }
-    }
-
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
@@ -162,6 +197,17 @@ public class PomodoroEngine : BackgroundService
         {
             lock (_lock)
             {
+                // Tarayıcı kapandı mı kontrolü:
+                // Tarayıcı ilk 15 saniyede açılmazsa veya açıldıktan sonra 5 saniyeden fazla sinyal gelmezse kapat
+                var isGracePeriodOver = (DateTime.UtcNow - _startedAt) > TimeSpan.FromSeconds(15);
+                var isHeartbeatLost = _hasReceivedFirstHeartbeat && (DateTime.UtcNow - _lastHeartbeat) > TimeSpan.FromSeconds(5);
+
+                if ((!_hasReceivedFirstHeartbeat && isGracePeriodOver) || isHeartbeatLost)
+                {
+                    _lifetime.StopApplication();
+                    return;
+                }
+
                 if (_status != TimerStatus.Running) continue;
 
                 if (_remainingSec > 0)

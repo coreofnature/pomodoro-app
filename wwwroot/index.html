@@ -157,6 +157,16 @@
 
         setInterval(syncState, 1000);
         syncState();
+
+        //heartbeat
+        setInterval(() => {
+        fetch('/api/heartbeat', { method: 'POST' }).catch(() => {});
+        }, 2000);
+
+        window.addEventListener('pagehide', () => {
+        navigator.sendBeacon('/api/shutdown');
+        });
+
     </script>
 </body>
 
